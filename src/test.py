@@ -106,7 +106,7 @@ def predict(text: str, threshold: float = 0.5) -> Tuple[Dict[str, int], Dict[str
 
 # 5) quick demo ----------------------------------------------------------------
 if __name__ == "__main__":
-    sample = "painted on my face"
+    sample = "I am happy today"
     labs, scs = predict(sample)
     print("\nText:", sample)
     print("Labels:", labs)
