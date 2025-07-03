@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from data_prep import clean_text          # same pre-processing used during training
 from model     import IntensityClassifier # swap if your class is EmotionClassifier
-
+import pandas as pd
 # ──────────────────────────────────────────────────────────────────────────────
 # Config – tweak as needed
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,8 +106,15 @@ def predict(text: str, threshold: float = 0.5) -> Tuple[Dict[str, int], Dict[str
 
 # 5) quick demo ----------------------------------------------------------------
 if __name__ == "__main__":
-    sample = "I am happy today"
+    sample = ""
     labs, scs = predict(sample)
     print("\nText:", sample)
     print("Labels:", labs)
     print("Scores:", scs)
+    
+    df = pd.read_csv('../data/processed/track-b-clean.csv', encoding='unicode_escape')
+    for text in df['text']:
+        labs, scs = predict(text)
+        print("Text:", text)
+        print("Labels:", labs)
+        print("Scores:", scs)
