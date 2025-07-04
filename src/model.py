@@ -1,292 +1,325 @@
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
-import torch
-from torch.utils.data import TensorDataset
+"""
+Multi-label Emotion Intensity Classification using RoBERTa
+
+This module implements a deep learning model for classifying emotion intensity
+across five emotions (anger, fear, joy, sadness, surprise) with intensity levels 0-3.
+"""
+
+import os
 import re
 import pandas as pd
-import os
-from data_prep import clean_text
-from torch.utils.data import random_split, DataLoader
+import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from transformers import AutoTokenizer, AutoModel
 from sklearn.metrics import f1_score
-from train import calculate_multilabel_f1, eval_epoch, train_epoch
-import numpy as np
 
-# Provided configuration options
-lr_options = 5e-5
-batch_size_options = 32  # Start conservative, increase if memory allows
-max_length_options = 256
+from data_prep import clean_text
+from evaluate import calculate_multilabel_f1_score, evaluate_epoch, train_epoch
 
-def analyze_text_lengths(texts):
+
+# Constants
+# PRETRAINED_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+PRETRAINED_MODEL =   "distilbert-base-uncased"
+
+EMOTION_LABELS = ["anger", "fear", "joy", "sadness", "surprise"]
+MAX_SEQUENCE_LENGTH = 128
+NUM_INTENSITY_CLASSES = 4
+
+
+def tokenize_texts(texts):
     """
-    Analyze text lengths to determine optimal max_length.
-    """
-    lengths = [len(text.split()) for text in texts]
-    print(f"Text length stats:")
-    print(f"  Mean: {np.mean(lengths):.1f}")
-    print(f"  Median: {np.median(lengths):.1f}")
-    print(f"  95th percentile: {np.percentile(lengths, 95):.1f}")
-    print(f"  Max: {max(lengths)}")
+    Tokenize input texts using sentiment-analysis BERT tokenizer.
     
-    # Recommend max_length based on 95th percentile
-    recommended = min(512, max(128, int(np.percentile(lengths, 95) * 1.2)))
-    print(f"  Recommended max_length: {recommended}")
-    return recommended
-
-def word_tokenizer(texts, max_length=256):
+    Args:
+        texts: List of text strings to tokenize
+        
+    Returns:
+        Dictionary containing tokenized encodings with input_ids and attention_mask
     """
-    Tokenises the input text into a list of words with optimized max_length.
-    """
-    tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
     encodings = tokenizer(
         texts,
-        padding="max_length",    
-        truncation=True,         
-        max_length=max_length,   # Increased from 128
-        return_tensors="pt"      
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_SEQUENCE_LENGTH,
+        return_tensors="pt"
     )
     return encodings
 
+
 def create_tensor_dataset(encodings, labels):
     """
-    Converts encodings into a TensorDataset.
+    Create a TensorDataset from tokenized encodings and labels.
+    
+    Args:
+        encodings: Dictionary containing input_ids and attention_mask tensors
+        labels: Tensor of emotion intensity labels
+        
+    Returns:
+        TensorDataset object ready for DataLoader
     """
     input_ids = encodings['input_ids']
     attention_mask = encodings['attention_mask']
     return TensorDataset(input_ids, attention_mask, labels)
 
-def prepare_dataset(data_path, max_length=256):
+
+def prepare_dataset(data_path):
     """
     Prepare dataset for multi-label emotion intensity classification.
     Each emotion has intensity values from 0-3.
+    
+    Args:
+        data_path: Path to the CSV file containing the dataset
+        
+    Returns:
+        TensorDataset ready for training
     """
     clean_data = pd.read_csv(data_path, encoding='unicode_escape')
     texts = clean_data["text"].tolist()
-    
-    # Analyze text lengths and get recommendation
-    recommended_length = analyze_text_lengths(texts)
-    actual_max_length = max_length if max_length else recommended_length
-    print(f"Using max_length: {actual_max_length}")
-    
-    encoding = word_tokenizer(texts, max_length=actual_max_length)
+    encodings = tokenize_texts(texts)
     
     # Convert emotion intensity labels (0-3) to long tensor for CrossEntropyLoss
-    emotion_cols = ["anger", "fear", "joy", "sadness", "surprise"]
-    labels = torch.tensor(clean_data[emotion_cols].values, dtype=torch.long)
+    labels = torch.tensor(clean_data[EMOTION_LABELS].values, dtype=torch.long)
     
     # Verify label ranges are correct (0-3)
     print(f"Label ranges: min={labels.min().item()}, max={labels.max().item()}")
     assert labels.min() >= 0 and labels.max() <= 3, "Labels must be in range 0-3"
     
-    tensor_dataset_obj = create_tensor_dataset(encoding, labels)
-    print("TensorDataset created with {} samples.".format(len(tensor_dataset_obj)))
-    return tensor_dataset_obj
-  
-def load_data(data_path, batch_size=32, max_length=256):
-    tensorDataset = prepare_dataset(data_path, max_length)
-    total_size = len(tensorDataset)
-    val_size = int(0.15 * total_size)  # Increased validation set to 15%     
-    train_size = total_size - val_size
+    tensor_dataset = create_tensor_dataset(encodings, labels)
+    print(f"TensorDataset created with {len(tensor_dataset)} samples.")
+    return tensor_dataset
 
-    train_ds, val_ds = random_split(tensorDataset, [train_size, val_size])   
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size) 
-    return train_loader, val_loader
+def load_data(data_path, batch_size=16):
+    """
+    Load and split data into training and validation sets.
+    
+    Args:
+        data_path: Path to the dataset CSV file
+        batch_size: Batch size for DataLoaders
+        
+    Returns:
+        Tuple of (train_loader, validation_loader)
+    """
+    tensor_dataset = prepare_dataset(data_path)
+    total_size = len(tensor_dataset)
+    validation_size = int(0.1 * total_size)
+    train_size = total_size - validation_size
 
-class IntensityClassifier(nn.Module):
-    def __init__(self, pretrained_model="google-bert/bert-base-uncased", num_classes=4, dropout_rate=0.3):
+    train_dataset, validation_dataset = random_split(tensor_dataset, [train_size, validation_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    validation_loader = DataLoader(validation_dataset, batch_size=batch_size)
+    return train_loader, validation_loader
+
+
+class EmotionIntensityClassifier(nn.Module):
+    """
+    Multi-label emotion intensity classifier using RoBERTa backbone.
+    
+    This model classifies text into 5 emotions with intensity levels 0-3 for each emotion.
+    """
+    
+    def __init__(self, pretrained_model=PRETRAINED_MODEL, num_classes=NUM_INTENSITY_CLASSES):
+        """
+        Initialize the emotion intensity classifier.
+        
+        Args:
+            pretrained_model: Name of the pretrained model to use as backbone
+            num_classes: Number of intensity classes (default: 4 for levels 0-3)
+        """
         super().__init__()
+        # Using sentiment-analysis specific model for better emotion understanding
         self.backbone = AutoModel.from_pretrained(pretrained_model)
-        hidden = self.backbone.config.hidden_size
-        self.emotion_names = ["anger", "fear", "joy", "sadness", "surprise"]
+        hidden_size = self.backbone.config.hidden_size
+        self.emotion_names = EMOTION_LABELS
         
-        # Add dropout for regularization
-        self.dropout = nn.Dropout(dropout_rate)
-        
-        # Create separate classification heads for each emotion with dropout
-        self.heads = nn.ModuleDict({
-            emo: nn.Sequential(
-                nn.Linear(hidden, hidden // 2),
+        # Create separate classification heads for each emotion with dropout for regularization
+        self.dropout = nn.Dropout(0.3)
+        self.classification_heads = nn.ModuleDict({
+            emotion: nn.Sequential(
+                nn.Linear(hidden_size, hidden_size // 2),
                 nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden // 2, num_classes)
+                nn.Linear(hidden_size//2, hidden_size // 4),
+                nn.ReLU(),
+                nn.Linear(hidden_size//4, hidden_size // 6),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_size // 6, num_classes)
             )
-            for emo in self.emotion_names
+            for emotion in self.emotion_names
         })
 
     def forward(self, input_ids, attention_mask):
-        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0, :]  # [CLS] token
-        cls = self.dropout(cls)
+        """
+        Forward pass through the model.
+        
+        Args:
+            input_ids: Token IDs tensor of shape [batch_size, sequence_length]
+            attention_mask: Attention mask tensor of shape [batch_size, sequence_length]
+            
+        Returns:
+            Dictionary mapping emotion names to logits tensors
+        """
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        cls_representation = outputs.last_hidden_state[:, 0, :]  # [CLS] token
+        cls_representation = self.dropout(cls_representation)
         
         # Get logits for each emotion
-        logits = {emo: head(cls) for emo, head in self.heads.items()}
+        logits = {emotion: head(cls_representation) for emotion, head in self.classification_heads.items()}
         return logits
 
-class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
 
-    def __call__(self, val_score):
-        if self.best_score is None:
-            self.best_score = val_score
-        elif val_score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = val_score
-            self.counter = 0
-
-def train_epoch_optimized(model, train_loader, optimizer, scheduler, criterion, device):
+def train_epoch_example(model, train_loader, optimizer, criterion, device):
     """
-    Optimized training epoch with gradient clipping and better loss handling.
+    Training epoch for multi-label emotion intensity classification.
+    Each emotion is classified independently into 4 intensity levels (0-3).
+    
+    Args:
+        model: The emotion intensity classifier model
+        train_loader: DataLoader for training data
+        optimizer: Optimizer for updating model parameters
+        criterion: Loss function (CrossEntropyLoss)
+        device: Device to run computation on
+        
+    Returns:
+        Average training loss for the epoch
     """
     model.train()
     total_loss = 0
     
     for batch in train_loader:
-        input_ids, attention_mask, labels = [b.to(device) for b in batch]
+        input_ids, attention_mask, labels = [tensor.to(device) for tensor in batch]
         
         optimizer.zero_grad()
         logits = model(input_ids, attention_mask)
         
         # Calculate loss for each emotion separately
-        loss = 0
-        for i, emo in enumerate(model.emotion_names):
-            emo_labels = labels[:, i]  # Shape: [batch_size] with values 0-3
-            emo_logits = logits[emo]   # Shape: [batch_size, 4] (4 intensity classes)
-            loss += criterion(emo_logits, emo_labels)
+        # labels shape: [batch_size, 5] where each column is emotion intensity (0-3)
+        batch_loss = 0
+        for i, emotion in enumerate(model.emotion_names):
+            emotion_labels = labels[:, i]  # Shape: [batch_size] with values 0-3
+            emotion_logits = logits[emotion]  # Shape: [batch_size, 4] (4 intensity classes)
+            batch_loss += criterion(emotion_logits, emotion_labels)
         
         # Average the loss across emotions
-        loss = loss / len(model.emotion_names)
+        batch_loss = batch_loss / len(model.emotion_names)
         
-        loss.backward()
-        
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+        batch_loss.backward()
         optimizer.step()
-        scheduler.step()  # Update learning rate
-        total_loss += loss.item()
+        total_loss += batch_loss.item()
     
     return total_loss / len(train_loader)
 
-def hyperparameter_search(data_path, models_dir):
-    """
-    Perform basic hyperparameter search for learning rate and batch size.
-    """
-    # Use provided configuration
-    lr = lr_options
-    batch_size = batch_size_options
-    max_length = max_length_options
-    
-    best_config = None
-    print("Using configuration: lr={}, batch_size={}, max_length={}".format(lr, batch_size, max_length))
-    try:
-        # Quick training for 3 epochs to evaluate
-        config = {
-            'lr': lr,
-            'batch_size': batch_size,
-            'max_length': max_length,
-            'epochs': 3  # Quick evaluation
-        }
-        
-        best_config = config
-        
-    except RuntimeError as e:
-        if "out of memory" in str(e):
-            print(f"OOM error - skipping this configuration")
-    
-    
-    return best_config
 
-def train_with_config(data_path, config, models_dir, save_model=True):
+def evaluate_epoch_example(model, validation_loader, device):
     """
-    Train model with specific configuration.
+    Evaluation epoch for multi-label emotion intensity classification.
+    Returns predictions and true labels for each emotion.
+    
+    Args:
+        model: The emotion intensity classifier model
+        validation_loader: DataLoader for validation data
+        device: Device to run computation on
+        
+    Returns:
+        Tuple of (all_predictions, all_labels) as dictionaries
     """
+    model.eval()
+    all_predictions = {emotion: [] for emotion in model.emotion_names}
+    all_labels = {emotion: [] for emotion in model.emotion_names}
+    
+    with torch.no_grad():
+        for batch in validation_loader:
+            input_ids, attention_mask, labels = [tensor.to(device) for tensor in batch]
+            logits = model(input_ids, attention_mask)
+            
+            for i, emotion in enumerate(model.emotion_names):
+                # Get predicted intensity class (0-3)
+                predictions = torch.argmax(logits[emotion], dim=1)
+                all_predictions[emotion].extend(predictions.cpu().numpy())
+                all_labels[emotion].extend(labels[:, i].cpu().numpy())
+    
+    return all_predictions, all_labels
+
+
+def calculate_multilabel_f1_example(all_labels, all_predictions):
+    """
+    Calculate macro F1 score across all emotions.
+    For intensity classification, we treat it as multi-class classification for each emotion.
+    
+    Args:
+        all_labels: Dictionary mapping emotion names to lists of true labels
+        all_predictions: Dictionary mapping emotion names to lists of predictions
+        
+    Returns:
+        Overall macro F1 score
+    """
+    f1_scores = []
+    
+    for emotion in EMOTION_LABELS:
+        f1 = f1_score(all_labels[emotion], all_predictions[emotion], average='macro')
+        f1_scores.append(f1)
+        print(f"{emotion.capitalize()} F1: {f1:.4f}")
+    
+    macro_f1 = sum(f1_scores) / len(f1_scores)
+    print(f"Overall Macro F1: {macro_f1:.4f}")
+    return macro_f1
+
+
+def main():
+    """Main training function."""
+    # Paths & hyperparameters
+    data_path = os.path.join('..', 'data', 'processed', 'track-b-clean.csv')
+    num_epochs = 14
+    learning_rate = 1e-5  # Slightly lower learning rate for sentiment-analysis models
+    batch_size = 16
+    models_directory = 'models'
+    os.makedirs(models_directory, exist_ok=True)
+    
     # Load data
-    train_loader, val_loader = load_data(
-        data_path, 
-        batch_size=config['batch_size'], 
-        max_length=config['max_length']
-    )
+    train_loader, validation_loader = load_data(data_path, batch_size=batch_size)
 
     # Device & model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = IntensityClassifier(dropout_rate=0.3).to(device)
+    model = EmotionIntensityClassifier().to(device)
 
-    # Optimizer with weight decay
-    optimizer = AdamW(
-        model.parameters(), 
-        lr=config['lr'],
-        weight_decay=0.01  # L2 regularization
-    )
-    
-    # Learning rate scheduler with warmup
-    num_training_steps = len(train_loader) * config['epochs']
-    num_warmup_steps = num_training_steps // 10  # 10% warmup
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
-    )
+    # Optimizer & loss - Updated with weight decay for better regularization
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss()
-    early_stopping = EarlyStopping(patience=7, min_delta=0.001)
 
-    best_f1 = 0
-    
+    best_f1_score = 0
+    best_model_path = None
+
+    print("Starting training...")
+    print(f"Device: {device}")
+    print(f"Epochs: {num_epochs}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"Batch size: {batch_size}")
+    print("-" * 50)
+
     # Training loop
-    for epoch in range(1, config['epochs'] + 1):
-        train_loss = train_epoch_optimized(model, train_loader, optimizer, scheduler, criterion, device)
-        preds, labels = eval_epoch(model, val_loader, device)
+    for epoch in range(1, num_epochs + 1):
+        # Use your existing functions or the example ones above
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        predictions, labels = evaluate_epoch(model, validation_loader, device)
         
-        f1 = calculate_multilabel_f1(labels, preds)
-        print(f"Epoch {epoch}: TrainLoss={train_loss:.4f}, ValMacroF1={f1:.4f}, LR={scheduler.get_last_lr()[0]:.2e}")
+        f1 = calculate_multilabel_f1_score(labels, predictions)
+        print(f"Epoch {epoch}: TrainLoss={train_loss:.4f}, ValMacroF1={f1:.4f}")
 
-        # Early stopping check
-        early_stopping(f1)
-        
         # Save best model
-        if f1 > best_f1:
-            best_f1 = f1
-            if save_model:
-                model_path = os.path.join(models_dir, 'best_model.pt')
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'config': config,
-                    'f1_score': f1
-                }, model_path)
-                print(f"Best model saved to: {model_path}")
-        
-        if early_stopping.early_stop:
-            print(f"Early stopping triggered at epoch {epoch}")
-            break
-    
-    return best_f1
+        if f1 > best_f1_score:
+            best_f1_score = f1
+            best_model_path = os.path.join(models_directory, 'best_emotion_intensity_model.pt')
+            torch.save(model.state_dict(), best_model_path)
+            print(f"✓ Best model saved to: {best_model_path}")
+            
+    print("Training completed!")
+    print(f"Best F1 score: {best_f1_score:.4f}")
+    print(f"Model saved as: {best_model_path}")
 
-# ---------- Main ----------
+
 if __name__ == "__main__":
-    # Paths & directories
-    data_path = os.path.join('..', 'data', 'processed', 'track-b-clean.csv')
-    models_dir = 'models'
-    os.makedirs(models_dir, exist_ok=True)
-    
-    # Option 1: Run hyperparameter search (recommended first time)
-    print("=== HYPERPARAMETER ===")
-    best_config = hyperparameter_search(data_path, models_dir)
-    
-    # Option 2: Train with best configuration found
-    print(f"\n=== TRAINING MODEL ===")
-    best_config['epochs'] = 25  # Full training with more epochs
-    final_f1 = train_with_config(data_path, best_config, models_dir, save_model=True)
-    
-    print(f"\nFinal F1 Score: {final_f1:.4f}")
-  
-    
-  
+    main()

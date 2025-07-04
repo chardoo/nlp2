@@ -16,12 +16,14 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from data_prep import clean_text          # same pre-processing used during training
-from model     import IntensityClassifier # swap if your class is EmotionClassifier
+from  model     import EmotionIntensityClassifier # swap if your class is EmotionClassifier
 import pandas as pd
 # ──────────────────────────────────────────────────────────────────────────────
 # Config – tweak as needed
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-BACKBONE   = "distilbert-base-uncased"           # same HF checkpoint as training
+# BACKBONE   = "cardiffnlp/twitter-roberta-base-sentiment-latest"  
+BACKBONE =   "distilbert-base-uncased"
+# same HF checkpoint as training
 WEIGHTS    = Path("./models/best_model.pt")               # your saved file
 EMOTIONS   = ["anger", "fear", "joy", "sadness", "surprise"]
 MAX_LEN    = 128                                 # should match training
@@ -31,7 +33,7 @@ MAX_LEN    = 128                                 # should match training
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE)
 
 # 2) model
-model = IntensityClassifier(BACKBONE).to(DEVICE)
+model = EmotionIntensityClassifier(BACKBONE).to(DEVICE)
 
 # 3) robust checkpoint loader --------------------------------------------------
 def _strip(state, prefix: str):
